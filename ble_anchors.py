@@ -1,115 +1,171 @@
 
-import serial
+import socket
 import threading
 import time
 
-PORTS = {
-    1: "COM4",
-    2: "COM3",
-    4: "COM6",
-}
+# ==========================================
+# WIFI BLE ANCHOR RECEIVER
+# ==========================================
 
-BAUD_RATE = 115200
+# All anchors send data to this UDP port
+UDP_IP = "0.0.0.0"
+UDP_PORT = 5005
+
+# Anchors to monitor
+ANCHOR_IDS = [1, 3]
+
+# Timeout before anchor becomes inactive
 TIMEOUT = 3.0
 
 anchors = {}
 lock = threading.Lock()
 
 
-def read_anchor(anchor_id, port):
+# ==========================================
+# RECEIVE DATA FROM ESP32 ANCHORS
+# ==========================================
 
-    try:
-        ser = serial.Serial(port, BAUD_RATE, timeout=1)
-        time.sleep(2)
+def receive_anchors():
 
-        print(f"Anchor {anchor_id} connected on {port}")
+    sock = socket.socket(
+        socket.AF_INET,
+        socket.SOCK_DGRAM
+    )
 
-        while True:
-            line = ser.readline().decode(
+    sock.bind((UDP_IP, UDP_PORT))
+    sock.settimeout(1.0)
+
+    print(f"Listening for ESP32 anchors on UDP port {UDP_PORT}")
+
+    while True:
+
+        try:
+            data, address = sock.recvfrom(1024)
+
+            line = data.decode(
                 "utf-8", errors="ignore"
             ).strip()
-            #if line.startswith(("DATA,", "LOST,")):
-                #print(f"[COM {port}] {line}")
 
-            if line.startswith("DATA,"):
-                try:
-                    parts = line.split(",")
+            if not line.startswith("DATA,"):
+                continue
 
-                    reported_id = int(parts[1])
-                    rssi = float(parts[2])
-                    distance = float(parts[3])
-                    score = float(parts[4])
+            parts = line.split(",")
 
-                    if reported_id != anchor_id:
-                        continue
+            anchor_id = int(parts[1])
 
-                    with lock:
-                        anchors[anchor_id] = {
-                            "rssi": rssi,
-                            "distance": distance,
-                            "score": score,
-                            "time": time.monotonic()
-                        }
+            if anchor_id not in ANCHOR_IDS:
+                continue
 
-                except (ValueError, IndexError):
-                    continue
+            # Phone lost
+            if len(parts) == 3 and parts[2] == "LOST":
 
-            elif line.startswith("LOST,"):
                 with lock:
                     anchors.pop(anchor_id, None)
 
-    except serial.SerialException as e:
-        print(f"Anchor {anchor_id} error: {e}")
+                print(f"Anchor {anchor_id}: Phone lost")
+                continue
+
+            if len(parts) != 5:
+                continue
+
+            rssi = float(parts[2])
+            distance = float(parts[3])
+            score = float(parts[4])
+
+            with lock:
+                anchors[anchor_id] = {
+                    "rssi": rssi,
+                    "distance": distance,
+                    "score": score,
+                    "time": time.monotonic(),
+                    "ip": address[0]
+                }
+
+        except socket.timeout:
+            continue
+
+        except (ValueError, IndexError):
+            continue
+
+        except OSError as e:
+            print(f"UDP socket error: {e}")
+            break
+
+    sock.close()
 
 
-for anchor_id, port in PORTS.items():
+# ==========================================
+# START RECEIVER THREAD
+# ==========================================
 
-    thread = threading.Thread(
-        target=read_anchor,
-        args=(anchor_id, port),
-        daemon=True
-    )
+thread = threading.Thread(
+    target=receive_anchors,
+    daemon=True
+)
 
-    thread.start()
+thread.start()
 
 
-while True:
+# ==========================================
+# DISPLAY ANCHOR DATA
+# ==========================================
 
-    with lock:
-        now = time.monotonic()
+print("Waiting for BLE anchors over WiFi...")
 
-        active = {
-            anchor_id: data.copy()
-            for anchor_id, data in anchors.items()
-            if now - data["time"] < TIMEOUT
-        }
+try:
+    while True:
 
-    if active:
+        with lock:
+            now = time.monotonic()
 
-        # Higher RSSI (less negative) = stronger signal.
-        closest = max(
-            active,
-            key=lambda a: active[a]["rssi"]
-        )
+            # Remove stale anchor measurements
+            stale = [
+                anchor_id
+                for anchor_id, data in anchors.items()
+                if now - data["time"] >= TIMEOUT
+            ]
 
-        print("\n-----------------------------")
+            for anchor_id in stale:
+                del anchors[anchor_id]
 
-        for anchor_id in sorted(PORTS):
+            active = {
+                anchor_id: data.copy()
+                for anchor_id, data in anchors.items()
+            }
 
-            if anchor_id in active:
-                data = active[anchor_id]
+        if active:
 
-                print(
-                    f"Anchor {anchor_id}: "
-                    f"{data['rssi']:.1f} dBm | "
-                    f"{data['distance']:.2f} m"
-                )
-            else:
-                print(f"Anchor {anchor_id}: No signal")
+            # Higher RSSI = stronger signal
+            closest = max(
+                active,
+                key=lambda a: active[a]["rssi"]
+            )
 
-        print(f"\nCLOSEST ANCHOR: {closest}")
+            print("\n-----------------------------")
 
-    else:
-        print("Waiting for phone...")
+            for anchor_id in ANCHOR_IDS:
 
-    time.sleep(0.5)
+                if anchor_id in active:
+
+                    data = active[anchor_id]
+
+                    print(
+                        f"Anchor {anchor_id}: "
+                        f"{data['rssi']:.1f} dBm | "
+                        f"{data['distance']:.2f} m"
+                    )
+
+                else:
+                    print(
+                        f"Anchor {anchor_id}: No signal"
+                    )
+
+            print(f"\nCLOSEST ANCHOR: {closest}")
+
+        else:
+            print("Waiting for phone...")
+
+        time.sleep(0.5)
+
+except KeyboardInterrupt:
+    print("\nStopping WiFi BLE receiver...")
